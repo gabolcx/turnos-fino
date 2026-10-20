@@ -2,8 +2,15 @@ name: Chequear turnos Fugazzotto
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # cada 15 minutos (GitHub puede demorarlo unos minutos)
+    # Cada 15 minutos de 08:00 a 01:00 hora argentina (UTC-3); de 01:00 a 08:00 no corre.
+    # GitHub usa UTC: 11-23 UTC = 08-20 ART y 0-3 UTC = 21-00:45 ART.
+    - cron: "*/15 11-23 * * *"
+    - cron: "*/15 0-3 * * *"
   workflow_dispatch:          # permite correrlo a mano desde la pestaña Actions
+
+permissions:
+  contents: read
+  actions: write   # para que el bot pueda pausar este workflow
 
 concurrency:
   group: turnos
@@ -34,6 +41,8 @@ jobs:
           PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '7' }}
           # Si hay turnos ofrecidos, espera tu respuesta en Telegram para reservar enseguida.
           LISTEN_MINUTES: "12"
           DRY_RUN: ${{ vars.DRY_RUN || '0' }}

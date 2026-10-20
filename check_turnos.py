@@ -35,6 +35,8 @@ BRANCH_ID = "2"  # Sanatorio Finochietto, Boulogne Sur Mer 972
 ART = timezone(timedelta(hours=-3))
 UA = "turnos-fino/1.0 (+https://github.com/gabolcx/turnos-fino)"
 XHR = {"X-Requested-With": "XMLHttpRequest"}
+WORKFLOW_FILE = "turnos.yml"
+QUIET_FROM, QUIET_TO = 1, 8  # sin chequeos de 01:00 a 08:00 ART
 
 
 def load_env(path=".env"):
@@ -287,13 +289,12 @@ def save_state(path, state):
 # ---------- Respuestas de Telegram ----------
 
 def handle_updates(state, portal_factory, dry_run, wait_seconds=0):
-    """Procesa los botones que tocaste. Devuelve True si se reservó algo."""
+    """Procesa los botones que tocaste en Telegram."""
     chat_id = str(env("TELEGRAM_CHAT_ID"))
     params = {"timeout": wait_seconds}
     if state.get("tg_offset"):
         params["offset"] = state["tg_offset"]
     updates = telegram("getUpdates", params, timeout=wait_seconds + 30).get("result", [])
-    booked = False
     for u in updates:
         state["tg_offset"] = u["update_id"] + 1
         q = u.get("callback_query")
@@ -304,6 +305,24 @@ def handle_updates(state, portal_factory, dry_run, wait_seconds=0):
             telegram("answerCallbackQuery", {"callback_query_id": q["id"], "text": "No autorizado"})
             continue
         parts = (q.get("data") or "").split("|")
+        if parts[0] in ("pause", "continue"):
+            remove_buttons(msg.get("message_id"))
+            state.pop("question", None)
+            if parts[0] == "continue":
+                telegram("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Sigo buscando"})
+                send("▶️ Sigo buscando turnos cada 15 minutos.")
+                continue
+            telegram("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Pausando…"})
+            try:
+                pause_workflow()
+                state["paused"] = True
+                send("⏸ Chequeo pausado en GitHub. Para retomarlo: pestaña Actions del repo → "
+                     "\"Chequear turnos Fugazzotto\" → Enable workflow.")
+                print("Workflow pausado.")
+            except Exception as e:
+                send(f"❌ No pude pausar el chequeo: {e}\nPausalo desde la pestaña Actions del repo.")
+                print(f"No se pudo pausar: {e}")
+            continue
         if parts[0] == "no":
             telegram("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Ok, no reservo nada"})
             remove_buttons(msg.get("message_id"))
@@ -330,11 +349,30 @@ def handle_updates(state, portal_factory, dry_run, wait_seconds=0):
              f"Verificalo en {BASE}portal/home (sección Agenda).")
         print(f"Resultado: {result}")
         if not dry_run:
-            booked = True
             for o in state["offers"]:
                 remove_buttons(o["message_id"])
             state["offers"] = []
-    return booked
+        if state.get("question"):
+            remove_buttons(state["question"])
+        state["question"] = send("¿Querés pausar el chequeo o que siga buscando turnos?", [
+            [{"text": "⏸ Pausar chequeo", "callback_data": "pause"}],
+            [{"text": "▶️ Seguir buscando", "callback_data": "continue"}]])
+
+
+def pause_workflow():
+    """Desactiva este workflow en GitHub (necesita GITHUB_TOKEN con permiso actions: write)."""
+    token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        raise RuntimeError("solo se puede pausar cuando corre en GitHub")
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/disable", method="PUT",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": UA})
+    urllib.request.urlopen(req, timeout=30).close()
+
+
+def quiet_hours(now):
+    """Entre la 01:00 y las 08:00 (hora argentina) no se chequea."""
+    return QUIET_FROM <= now.hour < QUIET_TO
 
 
 # ---------- Main ----------
@@ -370,6 +408,11 @@ def main():
     listen = float(os.environ.get("LISTEN_MINUTES") or 0) * 60
     state_file = os.environ.get("STATE_FILE") or "state.json"
     state = load_state(state_file)
+    state.pop("paused", None)
+
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and quiet_hours(datetime.now(ART)):
+        print("Horario de pausa (01:00 a 08:00 ART): no se chequea.")
+        return
 
     try:
         # 1) Botones que tocaste desde la última corrida.
@@ -406,11 +449,11 @@ def main():
                 remove_buttons(o["message_id"])
             state["offers"] = []
 
-        # 4) Mientras haya ofertas abiertas, esperar tu respuesta para reservar enseguida.
-        while state["offers"] and time.time() - started < listen:
+        # 4) Mientras haya ofertas o preguntas abiertas, esperar tu respuesta para actuar enseguida.
+        while ((state["offers"] or state.get("question")) and not state.get("paused")
+               and time.time() - started < listen):
             remaining = int(listen - (time.time() - started))
-            if handle_updates(state, new_portal, dry_run, wait_seconds=max(1, min(50, remaining))):
-                break
+            handle_updates(state, new_portal, dry_run, wait_seconds=max(1, min(50, remaining)))
             save_state(state_file, state)
     finally:
         save_state(state_file, state)
