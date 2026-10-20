@@ -12,7 +12,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +34,9 @@ jobs:
           PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Si hay turnos ofrecidos, espera tu respuesta en Telegram para reservar enseguida.
+          LISTEN_MINUTES: "12"
+          DRY_RUN: ${{ vars.DRY_RUN || '0' }}
         run: python check_turnos.py
 
       - name: Guardar estado
