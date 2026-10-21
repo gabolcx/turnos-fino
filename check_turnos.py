@@ -33,6 +33,10 @@ AREA_NAME = "Fugazzotto de la cruz Juan Jesus"
 COMPONENT_CODE = "31"  # Gastroenterología
 BRANCH_ID = "2"  # Sanatorio Finochietto, Boulogne Sur Mer 972
 ART = timezone(timedelta(hours=-3))
+# Forlano (Nefrología): solo avisa si aparece un turno anterior a FORLANO_DEADLINE
+# (tu turno actual). Llegada esa fecha, este chequeo se apaga solo.
+FORLANO = {"area_code": "2130", "area_name": "Forlano Carlos Gabriel", "component_code": "46"}
+FORLANO_DEADLINE = datetime(2026, 10, 22, 19, 0, tzinfo=ART)
 UA = "turnos-fino/1.0 (+https://github.com/gabolcx/turnos-fino)"
 XHR = {"X-Requested-With": "XMLHttpRequest"}
 WORKFLOW_FILE = "turnos.yml"
@@ -140,12 +144,12 @@ class Portal:
         parser.feed(self.request("appoint/findAvailability/wizard"))
         self.wizard = parser.values
 
-    def search(self):
+    def search(self, area_code=AREA_CODE, area_name=AREA_NAME, component_code=COMPONENT_CODE):
         """Equivale a elegir el profesional + 'Lo antes posible' + 'Ver agenda'."""
         data = self.get_json("appoint/findAvailability/wizard/doSearch", {
             "attentionType": "P", "searchType": "Area",
-            "jsonComponentCodes": json.dumps([COMPONENT_CODE]),
-            "areaName": urllib.parse.quote(AREA_NAME), "areaCode": AREA_CODE,
+            "jsonComponentCodes": json.dumps([component_code]),
+            "areaName": urllib.parse.quote(area_name), "areaCode": area_code,
             "branchId": BRANCH_ID, "cityId": "", "startDate": "", "daysSelected": "",
             "timeFrom": "", "timeTo": "", "resultOrder": "dateOrder",
             "followedBookingsCount": "1", "checkAreaProfile": "false", "timeZoneId": "",
@@ -370,6 +374,28 @@ def pause_workflow():
     urllib.request.urlopen(req, timeout=30).close()
 
 
+def check_forlano(portal, state, now):
+    """Avisa si hay un turno con Forlano antes de FORLANO_DEADLINE; después de esa fecha no hace nada."""
+    if now >= FORLANO_DEADLINE:
+        if not state.get("forlano_done"):
+            send(f"⏹ Terminó el chequeo de Forlano: llegó el {fmt(FORLANO_DEADLINE)}. "
+                 "El de Fugazzotto sigue igual.")
+            state["forlano_done"] = True
+        return
+    slots = portal.search(**FORLANO)
+    earlier = [s for s in slots if now <= s["start"] < FORLANO_DEADLINE]
+    first = fmt(slots[0]["start"]) if slots else "ninguno"
+    print(f"Forlano | primer turno: {first} | antes de {fmt(FORLANO_DEADLINE)}: {len(earlier)}")
+    already = set(state.get("forlano_notified", []))
+    new = [s for s in earlier if s["start"].isoformat() not in already]
+    if new:
+        lines = "\n".join(f"• {fmt(s['start'])}" for s in earlier[:20])
+        send(f"🩺 Hay turnos con Forlano (Nefrología, Finochietto) antes de tu turno del "
+             f"{fmt(FORLANO_DEADLINE)}:\n{lines}\n\nSi te sirve, cambialo en {BASE}portal/home")
+        print(f"Aviso Forlano enviado: {len(new)} turno(s) nuevo(s).")
+    state["forlano_notified"] = sorted(s["start"].isoformat() for s in earlier)
+
+
 def quiet_hours(now):
     """Entre la 01:00 y las 08:00 (hora argentina) no se chequea."""
     return QUIET_FROM <= now.hour < QUIET_TO
@@ -442,6 +468,12 @@ def main():
             print(f"Aviso enviado: {len(new)} turno(s) nuevo(s).")
         # Guardamos solo los que siguen disponibles, así si uno se libera de nuevo vuelve a avisar.
         state["notified"] = sorted(s["start"].isoformat() for s in in_window)
+
+        # 2b) Forlano, con fecha límite. Si falla, no frena el chequeo de Fugazzotto.
+        try:
+            check_forlano(portal, state, now)
+        except Exception as e:
+            print(f"ERROR chequeando Forlano: {e}", file=sys.stderr)
 
         # 3) Ofertas viejas: sacarles los botones cuando ya no hay turnos en la ventana.
         if not in_window:
