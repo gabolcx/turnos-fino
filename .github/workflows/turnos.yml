@@ -1,0 +1,67 @@
+name: Chequear turnos
+
+# GitHub no garantiza lanzar los cron a horario (en la práctica saltea muchos), así que cada
+# corrida dura varias horas y chequea cada 15 minutos por su cuenta. El cron solo se asegura
+# de que siempre haya una corrida activa o en cola de 08:00 a 01:00 hora argentina.
+on:
+  schedule:
+    # GitHub usa UTC (ART = UTC-3): 11-23 UTC = 08-20 ART y 0-3 UTC = 21-00 ART.
+    - cron: "17 11-23 * * *"
+    - cron: "17 0-3 * * *"
+  workflow_dispatch:          # permite correrlo a mano desde la pestaña Actions
+    inputs:
+      run_minutes:
+        description: "Minutos que dura la corrida (0 = un solo chequeo)"
+        default: "330"
+
+permissions:
+  contents: read
+  actions: write   # para que el bot pueda pausar este workflow
+
+# Una sola corrida a la vez; la siguiente queda en cola y arranca cuando termina la anterior.
+concurrency:
+  group: turnos
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Recuerda qué turnos ya se avisaron, para no repetir el mensaje.
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: turnos-state-${{ github.run_id }}
+          restore-keys: turnos-state-
+
+      - name: Chequear turnos
+        env:
+          PORTAL_EMAIL: ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Los médicos van como secrets para que no queden a la vista en el repo ni en los logs.
+          MAIN_DOCTOR: ${{ secrets.MAIN_DOCTOR }}
+          SECOND_DOCTOR: ${{ secrets.SECOND_DOCTOR }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '7' }}
+          DRY_RUN: ${{ vars.DRY_RUN || '0' }}
+          # 5 h 30 min por corrida (el límite de GitHub es 6 h), chequeando cada 15 minutos.
+          RUN_MINUTES: ${{ inputs.run_minutes || '330' }}
+          CHECK_EVERY_MINUTES: "15"
+        run: python -u check_turnos.py
+
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: turnos-state-${{ github.run_id }}
