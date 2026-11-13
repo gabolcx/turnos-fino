@@ -11,7 +11,8 @@ Los médicos van como secrets para que no queden a la vista en el repositorio ni
 Opcionales:
   DAYS_AHEAD (7)       ventana de días a mirar
   STATE_FILE           (state.json)
-  RUN_MINUTES (0)      cuánto dura la corrida; 0 = un solo chequeo
+  RUN_MINUTES (0)      cuánto dura la corrida; al terminar, en GitHub, deja en cola la siguiente.
+                       0 = un solo chequeo (ignora el horario de pausa y no encadena)
   CHECK_EVERY_MINUTES (15)  cada cuánto chequear dentro de la corrida (entre chequeos atiende Telegram)
   DRY_RUN (0)          1 = hace todo menos la confirmación final de la reserva
 
@@ -27,6 +28,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -38,6 +40,7 @@ UA = "turnos-fino/1.0 (+https://github.com/gabolcx/turnos-fino)"
 XHR = {"X-Requested-With": "XMLHttpRequest"}
 WORKFLOW_FILE = "turnos.yml"
 QUIET_FROM, QUIET_TO = 1, 8  # sin chequeos de 01:00 a 08:00 ART
+ALERT_AFTER = 4  # fallas seguidas antes de avisar por Telegram y pasar a reintentar cada CHECK_EVERY_MINUTES
 
 
 def load_env(path=".env"):
@@ -379,15 +382,55 @@ def handle_updates(state, portal_factory, dry_run, wait_seconds=0):
             [{"text": "▶️ Seguir buscando", "callback_data": "continue"}]])
 
 
-def pause_workflow():
-    """Desactiva este workflow en GitHub (necesita GITHUB_TOKEN con permiso actions: write)."""
+def workflow_api(method, action, body=None):
+    """Llama a la API de GitHub sobre este workflow (necesita GITHUB_TOKEN con permiso actions: write)."""
     token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
-        raise RuntimeError("solo se puede pausar cuando corre en GitHub")
+        raise RuntimeError("solo funciona cuando corre en GitHub")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": UA}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/disable", method="PUT",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": UA})
+        f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/{action}",
+        data=data, method=method, headers=headers)
     urllib.request.urlopen(req, timeout=30).close()
+
+
+def pause_workflow():
+    """Desactiva este workflow en GitHub."""
+    workflow_api("PUT", "disable")
+
+
+def launch_next_run():
+    """Deja en cola la próxima corrida, que arranca apenas termina esta (por el grupo de concurrencia).
+    Así siempre hay una corrida activa y no dependemos de que GitHub respete el cron."""
+    ref = os.environ.get("GITHUB_REF_NAME")
+    if not ref or not os.environ.get("GITHUB_TOKEN"):
+        print("No corre en GitHub: no se lanza otra corrida.")
+        return
+    for attempt in range(4):
+        try:
+            workflow_api("POST", "dispatches", {"ref": ref})
+            print("Próxima corrida en cola.")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code < 500:  # p. ej. workflow deshabilitado a mano: no insistir
+                print(f"No se lanzó la próxima corrida ({e}).")
+                return
+            print(f"Aviso: GitHub respondió {e} al lanzar la próxima corrida.")
+        except Exception as e:
+            print(f"Aviso: no se pudo lanzar la próxima corrida ({e}).")
+        time.sleep(10 * 2 ** attempt)
+    print("No se pudo lanzar la próxima corrida: queda el cron como respaldo.")
+
+
+def try_send(text):
+    try:
+        send(text)
+    except Exception as e:
+        print(f"Aviso: no se pudo mandar el mensaje por Telegram ({e})")
 
 
 def check_second(portal, state, now):
@@ -454,31 +497,45 @@ def main():
     run_for = float(os.environ.get("RUN_MINUTES") or 0) * 60
     every = float(os.environ.get("CHECK_EVERY_MINUTES") or 15) * 60
     state_file = os.environ.get("STATE_FILE") or "state.json"
-    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    single = run_for <= 0  # un solo chequeo (prueba a mano): ignora el horario de pausa y no encadena
     state = load_state(state_file)
     state.pop("paused", None)
 
     # Corre durante RUN_MINUTES: chequea cada CHECK_EVERY_MINUTES y, entre chequeo y chequeo,
-    # atiende los botones de Telegram. Así no depende de que GitHub lance cada corrida a horario.
+    # atiende los botones de Telegram. Al terminar deja en cola la corrida siguiente, así el
+    # chequeo no depende de que GitHub lance el cron a horario (en la práctica saltea la mayoría).
     failures = 0
+    quiet_noted = False
     try:
         while True:
-            if scheduled and quiet_hours(datetime.now(ART)):
-                print("Horario de pausa (01:00 a 08:00 ART): no se chequea.")
-                break
             cycle_start = time.time()
-            try:
-                check_once(state, new_portal, dry_run, days_ahead)
-                failures = 0
-            except Exception as e:  # portal o Telegram caídos: se reintenta en el próximo ciclo
-                failures += 1
-                print(f"ERROR en el chequeo ({failures} seguido/s): {e}", file=sys.stderr)
-                if failures >= 4:
-                    raise
+            if not single and quiet_hours(datetime.now(ART)):
+                # De 01:00 a 08:00 no se chequea, pero la corrida sigue viva (atendiendo Telegram)
+                # para que la cadena llegue a la mañana.
+                if not quiet_noted:
+                    print("Horario de pausa (01:00 a 08:00 ART): no se chequea.", flush=True)
+                    quiet_noted = True
+            else:
+                quiet_noted = False
+                try:
+                    check_once(state, new_portal, dry_run, days_ahead)
+                    failures = 0
+                    if state.pop("failing", None):
+                        try_send("✅ El chequeo de turnos volvió a funcionar.")
+                except Exception as e:  # portal o Telegram caídos: se reintenta, la corrida sigue
+                    failures += 1
+                    print(f"ERROR en el chequeo ({failures} seguido/s): {e}", file=sys.stderr)
+                    if single:
+                        raise
+                    if failures >= ALERT_AFTER and not state.get("failing"):
+                        state["failing"] = True
+                        try_send(f"⚠️ El chequeo de turnos falla hace {failures} intentos seguidos: {e}\n"
+                                 f"Sigo reintentando cada {every / 60:g} minutos.")
             save_state(state_file, state)
 
-            next_check = cycle_start + (every if failures == 0 else 60)
-            if state.get("paused") or next_check > started + run_for:
+            # Ante una falla reintenta al minuto; si sigue fallando, vuelve al ritmo normal.
+            next_check = cycle_start + (60 if 0 < failures < ALERT_AFTER else every)
+            if single or state.get("paused") or next_check > started + run_for:
                 break
             while time.time() < next_check and not state.get("paused"):
                 handle_updates(state, new_portal, dry_run,
@@ -488,6 +545,11 @@ def main():
                 break
     finally:
         save_state(state_file, state)
+
+    if not single and not state.get("paused"):
+        launch_next_run()
+    if failures:  # la corrida queda en rojo en Actions, pero la siguiente ya está en cola
+        sys.exit(f"El último chequeo falló ({failures} seguido/s).")
 
 
 def check_once(state, new_portal, dry_run, days_ahead):

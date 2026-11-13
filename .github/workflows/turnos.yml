@@ -1,22 +1,24 @@
 name: Chequear turnos
 
-# GitHub no garantiza lanzar los cron a horario (en la práctica saltea muchos), así que cada
-# corrida dura varias horas y chequea cada 15 minutos por su cuenta. El cron solo se asegura
-# de que siempre haya una corrida activa o en cola de 08:00 a 01:00 hora argentina.
+# Cada corrida dura 5 h 30 min, chequea cada 15 minutos y, al terminar, deja en cola la
+# siguiente (workflow_dispatch), así siempre hay una activa. De 01:00 a 08:00 ART no chequea
+# pero sigue viva para que la cadena llegue a la mañana.
+# El cron es solo un respaldo por si la cadena se corta (GitHub saltea la mayoría de los cron).
+# Si arranca mientras otra corre, queda en cola y suele aparecer como "cancelled": es normal.
+# Para frenarlo todo: botón "Pausar" en Telegram, o Actions → "Chequear turnos" → Disable workflow.
 on:
   schedule:
-    # GitHub usa UTC (ART = UTC-3): 11-23 UTC = 08-20 ART y 0-3 UTC = 21-00 ART.
-    - cron: "17 11-23 * * *"
-    - cron: "17 0-3 * * *"
-  workflow_dispatch:          # permite correrlo a mano desde la pestaña Actions
+    # GitHub usa UTC (ART = UTC-3).
+    - cron: "17 * * * *"
+  workflow_dispatch:          # lo usa la cadena y permite correrlo a mano desde la pestaña Actions
     inputs:
       run_minutes:
-        description: "Minutos que dura la corrida (0 = un solo chequeo)"
+        description: "Minutos que dura la corrida (0 = un solo chequeo, sin encadenar)"
         default: "330"
 
 permissions:
   contents: read
-  actions: write   # para que el bot pueda pausar este workflow
+  actions: write   # para pausar este workflow y lanzar la corrida siguiente
 
 # Una sola corrida a la vez; la siguiente queda en cola y arranca cuando termina la anterior.
 concurrency:
